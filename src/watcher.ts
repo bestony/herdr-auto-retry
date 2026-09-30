@@ -11,10 +11,11 @@ import {
 import { getPluginStateDir } from "./config.js";
 import { getAgent, listAgents, readTail, sendPrompt } from "./herdr.js";
 
+// "blocked" is excluded: the agent waits on a human approval, and
+// `herdr agent prompt` rejects submissions to blocked agents.
 export const SETTLED: ReadonlySet<AgentStatus> = new Set([
   "idle",
   "done",
-  "blocked",
   "unknown",
 ]);
 
@@ -182,7 +183,12 @@ export async function processTarget(
         console.log(
           `[${target}] retrying with prompt "${config.prompt}" (attempt ${state.hit_count}, next backoff ${nextWait}s)`
         );
-        sendPrompt(target, config.prompt);
+        const sent = sendPrompt(target, config.prompt);
+        if (!sent.ok) {
+          console.error(
+            `[${target}] failed to send prompt (exit ${sent.status}): ${sent.error || "no output"}`
+          );
+        }
       } else {
         console.log(
           `[${target}] [dry-run] would send "${config.prompt}" (attempt ${state.hit_count})`

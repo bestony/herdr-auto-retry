@@ -96,7 +96,21 @@ export function readTail(target: string): string | null {
   return null;
 }
 
-export function sendPrompt(target: string, text: string): boolean {
-  const res = runHerdr(["agent", "send", target, text]);
-  return res.status === 0;
+export interface SendResult {
+  ok: boolean;
+  status: number;
+  error: string;
+}
+
+/**
+ * Submits a prompt to an agent via `herdr agent prompt`.
+ * herdr rejects the submission when the agent is blocked (agent_blocked).
+ */
+export function sendPrompt(target: string, text: string): SendResult {
+  const res = runHerdr(["agent", "prompt", target, text]);
+  if (res.status === 0) {
+    return { ok: true, status: 0, error: "" };
+  }
+  const error = (res.stderr || res.stdout || "").trim().slice(0, 300);
+  return { ok: false, status: res.status, error };
 }

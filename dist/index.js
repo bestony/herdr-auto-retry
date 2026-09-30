@@ -210,15 +210,18 @@ function readTail(target) {
   return null;
 }
 function sendPrompt(target, text) {
-  const res = runHerdr(["agent", "send", target, text]);
-  return res.status === 0;
+  const res = runHerdr(["agent", "prompt", target, text]);
+  if (res.status === 0) {
+    return { ok: true, status: 0, error: "" };
+  }
+  const error = (res.stderr || res.stdout || "").trim().slice(0, 300);
+  return { ok: false, status: res.status, error };
 }
 
 // src/watcher.ts
 var SETTLED = /* @__PURE__ */ new Set([
   "idle",
   "done",
-  "blocked",
   "unknown"
 ]);
 function flatten(text) {
@@ -345,7 +348,12 @@ async function processTarget(target, config, store, nowSec = Date.now() / 1e3) {
         console.log(
           `[${target}] retrying with prompt "${config.prompt}" (attempt ${state.hit_count}, next backoff ${nextWait}s)`
         );
-        sendPrompt(target, config.prompt);
+        const sent = sendPrompt(target, config.prompt);
+        if (!sent.ok) {
+          console.error(
+            `[${target}] failed to send prompt (exit ${sent.status}): ${sent.error || "no output"}`
+          );
+        }
       } else {
         console.log(
           `[${target}] [dry-run] would send "${config.prompt}" (attempt ${state.hit_count})`
@@ -447,6 +455,19 @@ function getLogFile() {
   import_node_fs3.default.mkdirSync(dir, { recursive: true });
   return import_node_path3.default.join(dir, "daemon.log");
 }
+var INVOCATION_ENV_KEYS = ["HERDR_PLUGIN_EVENT", "HERDR_PLUGIN_ACTION_ID"];
+function buildDaemonEnv(env) {
+  const out = { ...env };
+  for (const key of INVOCATION_ENV_KEYS) {
+    delete out[key];
+  }
+  return out;
+}
+function isStartupInvocation(command, env) {
+  if (command === "startup") return true;
+  if (command === "daemon") return false;
+  return env.HERDR_PLUGIN_EVENT === "startup";
+}
 function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -484,7 +505,7 @@ function startDaemon(entryPath) {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     windowsHide: true,
-    env: { ...process.env }
+    env: buildDaemonEnv(process.env)
   });
   const pid = child.pid;
   child.unref();
@@ -624,7 +645,7 @@ function runDashboard(config, store) {
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0] || "";
-  if (process.env.HERDR_PLUGIN_EVENT === "startup" || command === "startup") {
+  if (isStartupInvocation(command, process.env)) {
     const res = startDaemon(__filename);
     if (res.started) {
       console.log(`[auto-retry] started background daemon (PID: ${res.pid})`);

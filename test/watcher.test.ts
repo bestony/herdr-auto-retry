@@ -8,7 +8,9 @@ import {
   findMatch,
   backoffSeconds,
   StateStore,
+  SETTLED,
 } from "../src/watcher.js";
+import { buildDaemonEnv, isStartupInvocation } from "../src/daemon.js";
 import { loadConfig, DEFAULT_MATCHES } from "../src/config.js";
 
 describe("Watcher Helpers", () => {
@@ -112,5 +114,34 @@ describe("Config Loader", () => {
     assert.equal(config.prompt, "please retry");
     assert.equal(config.minWait, 20);
     assert.deepEqual(config.agents, ["codex", "claude"]);
+  });
+});
+
+describe("Daemon startup", () => {
+  test("daemon child is never treated as the startup hook", () => {
+    const env = { HERDR_PLUGIN_EVENT: "startup" };
+    assert.equal(isStartupInvocation("daemon", env), false);
+    assert.equal(isStartupInvocation("", env), true);
+    assert.equal(isStartupInvocation("startup", {}), true);
+    assert.equal(isStartupInvocation("scan", {}), false);
+  });
+
+  test("daemon env drops invocation-specific herdr vars", () => {
+    const env = buildDaemonEnv({
+      HERDR_PLUGIN_EVENT: "startup",
+      HERDR_PLUGIN_ACTION_ID: "start",
+      HERDR_PLUGIN_STATE_DIR: "/tmp/state",
+    });
+    assert.equal(env.HERDR_PLUGIN_EVENT, undefined);
+    assert.equal(env.HERDR_PLUGIN_ACTION_ID, undefined);
+    assert.equal(env.HERDR_PLUGIN_STATE_DIR, "/tmp/state");
+  });
+});
+
+describe("Settled statuses", () => {
+  test("blocked agents are not retried", () => {
+    assert.equal(SETTLED.has("blocked"), false);
+    assert.equal(SETTLED.has("idle"), true);
+    assert.equal(SETTLED.has("unknown"), true);
   });
 });

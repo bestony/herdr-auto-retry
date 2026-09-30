@@ -17,6 +17,30 @@ function getLogFile(): string {
   return path.join(dir, "daemon.log");
 }
 
+// Env vars that describe the invocation that spawned the daemon. The detached
+// child must not inherit them, or it re-enters the startup branch in main()
+// and exits at once.
+const INVOCATION_ENV_KEYS = ["HERDR_PLUGIN_EVENT", "HERDR_PLUGIN_ACTION_ID"];
+
+export function buildDaemonEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const key of INVOCATION_ENV_KEYS) {
+    delete out[key];
+  }
+  return out;
+}
+
+/**
+ * True when this process is the herdr startup hook and must only launch the
+ * daemon. The `daemon` command always runs its own subcommand, so a daemon
+ * child can never mistake itself for the hook.
+ */
+export function isStartupInvocation(command: string, env: NodeJS.ProcessEnv): boolean {
+  if (command === "startup") return true;
+  if (command === "daemon") return false;
+  return env.HERDR_PLUGIN_EVENT === "startup";
+}
+
 export function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -58,7 +82,7 @@ export function startDaemon(entryPath: string): { started: boolean; pid: number 
     detached: true,
     stdio: ["ignore", logFd, logFd],
     windowsHide: true,
-    env: { ...process.env },
+    env: buildDaemonEnv(process.env),
   });
 
   const pid = child.pid!;

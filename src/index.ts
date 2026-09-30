@@ -1,6 +1,6 @@
 import { loadConfig } from "./config.js";
 import { StateStore, scanOnce } from "./watcher.js";
-import { startDaemon, stopDaemon, runDaemonLoop, getRunningPid } from "./daemon.js";
+import { startDaemon, stopDaemon, runDaemonLoop, isStartupInvocation } from "./daemon.js";
 import { renderStatus, runDashboard } from "./dashboard.js";
 
 async function main(): Promise<void> {
@@ -8,7 +8,7 @@ async function main(): Promise<void> {
   const command = args[0] || "";
 
   // Herdr startup hook detection
-  if (process.env.HERDR_PLUGIN_EVENT === "startup" || command === "startup") {
+  if (isStartupInvocation(command, process.env)) {
     const res = startDaemon(__filename);
     if (res.started) {
       console.log(`[auto-retry] started background daemon (PID: ${res.pid})`);
