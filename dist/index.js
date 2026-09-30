@@ -29,7 +29,8 @@ var import_node_path = __toESM(require("path"));
 var import_node_os = __toESM(require("os"));
 var DEFAULT_MATCHES = [
   "Selected model is at capacity",
-  "stream disconnected before completion: Our servers are currently overloaded"
+  "stream disconnected before completion: Our servers are currently overloaded",
+  "exceeded retry limit, last status: 429 Too Many Requests"
 ];
 var DEFAULT_PROMPT = "continue";
 var DEFAULT_AGENTS = ["codex"];

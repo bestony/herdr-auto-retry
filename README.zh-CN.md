@@ -18,7 +18,11 @@ stream disconnected before completion: Our servers are currently overloaded.
 Please try again later.
 ```
 
-`herdr-auto-retry` 是一个原生的 Herdr 插件。它在后台监控 Agent 窗格，使用去抖动逻辑和指数退避算法检测容量报错，并在冷却后自动向 Agent 发送 `continue` 提示词，实现任务全自动继续执行。
+```text
+exceeded retry limit, last status: 429 Too Many Requests, request id: ...
+```
+
+`herdr-auto-retry` 是一个原生的 Herdr 插件。它在后台监控 Agent 窗格，使用去抖动逻辑和指数退避算法检测容量报错与 429 速率限制，并在冷却后自动向 Agent 发送 `continue` 提示词，实现任务全自动继续执行。
 
 ---
 
@@ -108,7 +112,8 @@ herdr plugin config-dir bestony.auto-retry
   },
   "matches": [
     "Selected model is at capacity",
-    "stream disconnected before completion: Our servers are currently overloaded"
+    "stream disconnected before completion: Our servers are currently overloaded",
+    "exceeded retry limit, last status: 429 Too Many Requests"
   ]
 }
 ```

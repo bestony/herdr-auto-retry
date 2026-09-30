@@ -6,6 +6,7 @@ import type { PluginConfig } from "./types.js";
 export const DEFAULT_MATCHES: string[] = [
   "Selected model is at capacity",
   "stream disconnected before completion: Our servers are currently overloaded",
+  "exceeded retry limit, last status: 429 Too Many Requests",
 ];
 
 export const DEFAULT_PROMPT = "continue";

@@ -18,7 +18,11 @@ stream disconnected before completion: Our servers are currently overloaded.
 Please try again later.
 ```
 
-`herdr-auto-retry` is an official Herdr plugin that watches your agent panes, detects capacity errors with debounce protection, calculates exponential backoff, and automatically submits a `continue` prompt.
+```text
+exceeded retry limit, last status: 429 Too Many Requests, request id: ...
+```
+
+`herdr-auto-retry` is an official Herdr plugin that watches your agent panes, detects capacity/rate-limit errors with debounce protection, calculates exponential backoff, and automatically submits a `continue` prompt.
 
 ---
 
@@ -107,7 +111,8 @@ You can create `config.json` in that directory:
   },
   "matches": [
     "Selected model is at capacity",
-    "stream disconnected before completion: Our servers are currently overloaded"
+    "stream disconnected before completion: Our servers are currently overloaded",
+    "exceeded retry limit, last status: 429 Too Many Requests"
   ]
 }
 ```

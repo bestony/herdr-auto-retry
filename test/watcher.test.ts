@@ -31,6 +31,16 @@ describe("Watcher Helpers", () => {
       "stream disconnected before completion:\n   Our servers are currently\n   overloaded. Please try again later.";
     assert.equal(findMatch(wrappedTail, patterns), patterns[1]);
 
+    const rateLimitTail =
+      "error: exceeded retry limit, last status: 429 Too Many Requests, request id: a85aeacd-c690-4600-8029-e972d8812837";
+    assert.equal(
+      findMatch(rateLimitTail, [
+        ...patterns,
+        "exceeded retry limit, last status: 429 Too Many Requests",
+      ]),
+      "exceeded retry limit, last status: 429 Too Many Requests"
+    );
+
     const cleanTail = "Agent is waiting for instructions: ready.";
     assert.equal(findMatch(cleanTail, patterns), null);
   });
