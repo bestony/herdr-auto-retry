@@ -23,9 +23,9 @@ export function flatten(text: string): string {
 }
 
 export function findMatch(haystack: string, patterns: string[]): string | null {
-  const flat = flatten(haystack);
+  const flat = flatten(haystack).toLowerCase();
   for (const pattern of patterns) {
-    if (flat.includes(flatten(pattern))) {
+    if (flat.includes(flatten(pattern).toLowerCase())) {
       return pattern;
     }
   }

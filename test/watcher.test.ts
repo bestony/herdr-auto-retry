@@ -41,6 +41,16 @@ describe("Watcher Helpers", () => {
       "exceeded retry limit, last status: 429 Too Many Requests"
     );
 
+    // Case-insensitivity check
+    const lowerRateLimitTail =
+      "exceeded retry limit, last status: 429 too many requests, request id: a85aeacd-c690-4600-8029-e972d8812837";
+    assert.equal(
+      findMatch(lowerRateLimitTail, [
+        "exceeded retry limit, last status: 429 Too Many Requests",
+      ]),
+      "exceeded retry limit, last status: 429 Too Many Requests"
+    );
+
     const cleanTail = "Agent is waiting for instructions: ready.";
     assert.equal(findMatch(cleanTail, patterns), null);
   });

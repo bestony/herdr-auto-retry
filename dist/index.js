@@ -30,7 +30,8 @@ var import_node_os = __toESM(require("os"));
 var DEFAULT_MATCHES = [
   "Selected model is at capacity",
   "stream disconnected before completion: Our servers are currently overloaded",
-  "exceeded retry limit, last status: 429 Too Many Requests"
+  "exceeded retry limit, last status: 429 Too Many Requests",
+  "429 Too Many Requests"
 ];
 var DEFAULT_PROMPT = "continue";
 var DEFAULT_AGENTS = ["codex"];
@@ -224,9 +225,9 @@ function flatten(text) {
   return text.split(/\s+/).filter(Boolean).join(" ");
 }
 function findMatch(haystack, patterns) {
-  const flat = flatten(haystack);
+  const flat = flatten(haystack).toLowerCase();
   for (const pattern of patterns) {
-    if (flat.includes(flatten(pattern))) {
+    if (flat.includes(flatten(pattern).toLowerCase())) {
       return pattern;
     }
   }
