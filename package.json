@@ -1,0 +1,36 @@
+{
+  "name": "herdr-auto-retry",
+  "version": "0.1.0",
+  "description": "Auto-continue Herdr agents when rate-limited, overloaded, or at capacity.",
+  "main": "dist/index.js",
+  "bin": {
+    "herdr-auto-retry": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/watcher.test.ts",
+    "dev": "tsup --watch"
+  },
+  "keywords": [
+    "herdr",
+    "herdr-plugin",
+    "codex",
+    "claude",
+    "auto-retry",
+    "automation"
+  ],
+  "author": "bestony",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

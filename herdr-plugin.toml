@@ -1,0 +1,41 @@
+id = "bestony.auto-retry"
+name = "Auto Retry"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Auto-continue Herdr agents when rate-limited, overloaded, or at capacity."
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+command = ["node", "dist/index.js", "daemon", "--start"]
+
+[[actions]]
+id = "status"
+title = "Retry status"
+description = "Show daemon state, tracked agents, and retry stats."
+command = ["node", "dist/index.js", "status"]
+
+[[actions]]
+id = "scan"
+title = "Scan and retry once"
+description = "Perform a single scan of all settled agents and retry if stuck."
+command = ["node", "dist/index.js", "scan"]
+
+[[actions]]
+id = "start"
+title = "Start watcher daemon"
+description = "Start the resident auto-retry daemon in the background."
+command = ["node", "dist/index.js", "daemon", "--start"]
+
+[[actions]]
+id = "stop"
+title = "Stop watcher daemon"
+description = "Stop the background auto-retry daemon."
+command = ["node", "dist/index.js", "daemon", "--stop"]
+
+[[panes]]
+id = "dashboard"
+title = "Auto Retry Monitor"
+placement = "popup"
+width = 80
+height = 24
+command = ["node", "dist/index.js", "dashboard"]

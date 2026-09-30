@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Local git locks
+.gitlock
+
+# Logs and runtime states
+*.log
+*.err
+daemon.pid
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# OpenSpec assets
+openspec/
