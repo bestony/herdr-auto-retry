@@ -24,9 +24,292 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // src/config.ts
+var import_node_fs2 = __toESM(require("fs"));
+var import_node_path2 = __toESM(require("path"));
+var import_node_os2 = __toESM(require("os"));
+
+// src/text.ts
+function flatten(text) {
+  return text.split(/\s+/).filter(Boolean).join(" ");
+}
+
+// src/codex-goal.ts
+var NEVER_RESUME = /* @__PURE__ */ new Set(["active", "complete"]);
+var DELIBERATE_STATUSES = /* @__PURE__ */ new Set(["paused", "budget_limited"]);
+var TURN_EVENTS = /* @__PURE__ */ new Set([
+  "task_started",
+  "task_complete",
+  "turn_aborted"
+]);
+function normalizeStatus(status) {
+  return status.trim().toLowerCase();
+}
+function isResumableStatus(status, configured) {
+  const s = normalizeStatus(status);
+  if (NEVER_RESUME.has(s)) return false;
+  return configured.some((c) => normalizeStatus(c) === s);
+}
+function containsAny(flatLower, markers) {
+  return markers.some((m) => {
+    const needle = flatten(m).toLowerCase();
+    return needle.length > 0 && flatLower.includes(needle);
+  });
+}
+function classifyScreen(screen, config) {
+  if (screen === null) return "unreadable";
+  const flat = flatten(screen).toLowerCase();
+  if (containsAny(flat, config.modalMarkers)) return "modal";
+  if (containsAny(flat, config.busyMarkers)) return "busy";
+  if (!containsAny(flat, config.idleMarkers)) return "no-composer";
+  return "idle";
+}
+function parseLastTurnEvent(chunk, startsMidLine) {
+  const lines = chunk.split("\n");
+  if (startsMidLine) lines.shift();
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes("event_msg")) continue;
+    if (!line.includes("task_started") && !line.includes("task_complete") && !line.includes("turn_aborted")) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (record?.type !== "event_msg") continue;
+    const type = record?.payload?.type;
+    if (typeof type === "string" && TURN_EVENTS.has(type)) {
+      return type;
+    }
+  }
+  return null;
+}
+function goalBackoffSeconds(attempt, minInterval, maxInterval) {
+  const exp = Math.min(Math.max(attempt - 1, 0), 10);
+  return Math.min(minInterval * 2 ** exp, Math.max(maxInterval, minInterval));
+}
+function decideGoalResume(input) {
+  const { goal, lastTurnEvent, screen, history, nowSec, config } = input;
+  if (!config.enabled) return { action: "skip", reason: "disabled", stalled: false };
+  if (goal.kind === "none") return { action: "skip", reason: "no-goal", stalled: false };
+  if (goal.kind === "error") return { action: "skip", reason: "goal-unavailable", stalled: false };
+  if (!isResumableStatus(goal.status, config.statuses)) {
+    return { action: "skip", reason: "status-not-resumable", stalled: false };
+  }
+  if (lastTurnEvent === null) return { action: "skip", reason: "turn-unknown", stalled: true };
+  if (lastTurnEvent === "task_started") {
+    return { action: "skip", reason: "turn-in-progress", stalled: true };
+  }
+  if (lastTurnEvent === "turn_aborted") {
+    return { action: "skip", reason: "turn-aborted", stalled: true };
+  }
+  const screenState = classifyScreen(screen, config);
+  if (screenState !== "idle") {
+    const reason = screenState === "unreadable" ? "screen-unreadable" : screenState === "busy" ? "screen-busy" : screenState === "modal" ? "screen-modal" : "screen-no-composer";
+    return { action: "skip", reason, stalled: true };
+  }
+  const nextAllowed = history.next_goal_resume_at ?? 0;
+  if (nowSec < nextAllowed) {
+    return {
+      action: "skip",
+      reason: "rate-limited",
+      stalled: true,
+      remaining: Math.max(0, Math.round(nextAllowed - nowSec))
+    };
+  }
+  const last = history.last_goal_resume_at ?? 0;
+  const fresh = last === 0 || nowSec - last > config.resetAfter;
+  const attempt = fresh ? 1 : (history.goal_resume_count ?? 0) + 1;
+  const backoff = goalBackoffSeconds(attempt, config.minInterval, config.maxInterval);
+  return { action: "resume", attempt, nextAllowedAt: nowSec + backoff, backoff };
+}
+
+// src/codex-store.ts
 var import_node_fs = __toESM(require("fs"));
-var import_node_path = __toESM(require("path"));
 var import_node_os = __toESM(require("os"));
+var import_node_path = __toESM(require("path"));
+var import_node_child_process = require("child_process");
+var import_node_url = require("url");
+var GOAL_DB_FILE = "goals_1.sqlite";
+var DEFAULT_ROLLOUT_TAIL_BYTES = 2 * 1024 * 1024;
+var SESSION_ID_RE = /^[A-Za-z0-9-]{1,128}$/;
+var GOAL_SQL = "SELECT status FROM thread_goals WHERE thread_id = ?";
+function defaultCodexHome(env = process.env) {
+  return env.CODEX_HOME || import_node_path.default.join(import_node_os.default.homedir(), ".codex");
+}
+function isValidSessionId(id) {
+  return SESSION_ID_RE.test(id);
+}
+function goalDbUris(dbPath) {
+  const base = (0, import_node_url.pathToFileURL)(dbPath).href;
+  return [
+    { uri: `${base}?mode=ro`, source: "ro" },
+    { uri: `${base}?mode=ro&immutable=1`, source: "immutable" }
+  ];
+}
+function errorMessage(err) {
+  return err?.message ? String(err.message) : String(err);
+}
+function lookupGoalStatus(dbPath, threadId, query = defaultSqliteQuery, exists = import_node_fs.default.existsSync) {
+  if (!isValidSessionId(threadId)) {
+    return { kind: "error", error: `invalid session id ${JSON.stringify(threadId)}` };
+  }
+  if (!exists(dbPath)) {
+    return { kind: "error", error: `goal database not found: ${dbPath}` };
+  }
+  const errors = [];
+  for (const { uri, source } of goalDbUris(dbPath)) {
+    try {
+      const rows = query(uri, GOAL_SQL, threadId);
+      const status = rows[0]?.status;
+      if (typeof status !== "string" || status === "") return { kind: "none" };
+      return { kind: "found", status, source };
+    } catch (err) {
+      errors.push(`${source}: ${errorMessage(err)}`);
+    }
+  }
+  return { kind: "error", error: errors.join("; ") };
+}
+var nodeSqliteCache;
+function loadNodeSqlite() {
+  if (nodeSqliteCache !== void 0) return nodeSqliteCache;
+  nodeSqliteCache = null;
+  try {
+    const getBuiltin = process.getBuiltinModule;
+    const mod = getBuiltin?.("node:sqlite");
+    if (mod?.DatabaseSync) nodeSqliteCache = mod;
+  } catch {
+  }
+  return nodeSqliteCache;
+}
+function nodeSqliteQuery(uri, sql, param) {
+  const mod = loadNodeSqlite();
+  if (!mod) throw new Error("node:sqlite is not available");
+  const db = new mod.DatabaseSync(uri, { readOnly: true });
+  try {
+    return db.prepare(sql).all(param);
+  } finally {
+    db.close();
+  }
+}
+function cliSqliteQuery(uri, sql, param) {
+  if (!isValidSessionId(param)) throw new Error("refusing to inline an unsafe parameter");
+  const inlined = sql.replace("?", `'${param}'`);
+  const res = (0, import_node_child_process.spawnSync)(process.env.HERDR_AUTO_RETRY_SQLITE_BIN || "sqlite3", ["-json", uri, inlined], {
+    encoding: "utf8",
+    timeout: 5e3,
+    windowsHide: true
+  });
+  if (res.error) throw res.error;
+  if (res.status !== 0) {
+    throw new Error((res.stderr || res.stdout || `sqlite3 exited ${res.status}`).trim().slice(0, 300));
+  }
+  const out = (res.stdout || "").trim();
+  if (!out) return [];
+  return JSON.parse(out);
+}
+function defaultSqliteQuery(uri, sql, param) {
+  return loadNodeSqlite() ? nodeSqliteQuery(uri, sql, param) : cliSqliteQuery(uri, sql, param);
+}
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function dayDir(sessionsDir, d, utc) {
+  const y = utc ? d.getUTCFullYear() : d.getFullYear();
+  const m = (utc ? d.getUTCMonth() : d.getMonth()) + 1;
+  const day = utc ? d.getUTCDate() : d.getDate();
+  return import_node_path.default.join(sessionsDir, String(y), pad2(m), pad2(day));
+}
+function uuidV7Millis(id) {
+  const hex = id.replace(/-/g, "");
+  if (!/^[0-9a-fA-F]{32}$/.test(hex) || hex[12] !== "7") return null;
+  const ms = parseInt(hex.slice(0, 12), 16);
+  if (ms < 15778368e5 || ms > Date.now() + 864e5) return null;
+  return ms;
+}
+function findInDir(dir, suffix) {
+  let names;
+  try {
+    names = import_node_fs.default.readdirSync(dir);
+  } catch {
+    return null;
+  }
+  const hit = names.find((n) => n.startsWith("rollout-") && n.endsWith(suffix));
+  return hit ? import_node_path.default.join(dir, hit) : null;
+}
+function listDesc(dir) {
+  try {
+    return import_node_fs.default.readdirSync(dir).filter((n) => /^\d+$/.test(n)).sort().reverse();
+  } catch {
+    return [];
+  }
+}
+function findRolloutFile(codexHome, sessionId, cache = rolloutPathCache) {
+  const cached = cache.get(sessionId);
+  if (cached && import_node_fs.default.existsSync(cached)) return cached;
+  cache.delete(sessionId);
+  if (!isValidSessionId(sessionId)) return null;
+  const sessionsDir = import_node_path.default.join(codexHome, "sessions");
+  const suffix = `-${sessionId}.jsonl`;
+  const tried = /* @__PURE__ */ new Set();
+  const ms = uuidV7Millis(sessionId);
+  if (ms !== null) {
+    for (const offset of [0, -864e5, 864e5]) {
+      const d = new Date(ms + offset);
+      for (const utc of [false, true]) {
+        const dir = dayDir(sessionsDir, d, utc);
+        if (tried.has(dir)) continue;
+        tried.add(dir);
+        const hit = findInDir(dir, suffix);
+        if (hit) {
+          cache.set(sessionId, hit);
+          return hit;
+        }
+      }
+    }
+  }
+  for (const y of listDesc(sessionsDir)) {
+    for (const m of listDesc(import_node_path.default.join(sessionsDir, y))) {
+      for (const d of listDesc(import_node_path.default.join(sessionsDir, y, m))) {
+        const dir = import_node_path.default.join(sessionsDir, y, m, d);
+        if (tried.has(dir)) continue;
+        const hit = findInDir(dir, suffix);
+        if (hit) {
+          cache.set(sessionId, hit);
+          return hit;
+        }
+      }
+    }
+  }
+  return null;
+}
+var rolloutPathCache = /* @__PURE__ */ new Map();
+function readFileTail(file, maxBytes) {
+  const fd = import_node_fs.default.openSync(file, "r");
+  try {
+    const size = import_node_fs.default.fstatSync(fd).size;
+    const start = Math.max(0, size - Math.max(1, maxBytes));
+    const length = size - start;
+    const buf = Buffer.alloc(length);
+    let read = 0;
+    while (read < length) {
+      const n = import_node_fs.default.readSync(fd, buf, read, length - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    return { text: buf.subarray(0, read).toString("utf8"), startsMidLine: start > 0 };
+  } finally {
+    import_node_fs.default.closeSync(fd);
+  }
+}
+function readLastTurnEvent(file, maxBytes) {
+  const { text, startsMidLine } = readFileTail(file, maxBytes);
+  return parseLastTurnEvent(text, startsMidLine);
+}
+
+// src/config.ts
 var DEFAULT_MATCHES = [
   "Selected model is at capacity",
   "stream disconnected before completion: Our servers are currently overloaded",
@@ -43,11 +326,28 @@ var DEFAULT_BUSY_INTERVAL = 5;
 var DEFAULT_INTERVAL = 10;
 var DEFAULT_IDLE_INTERVAL = 60;
 var DEFAULT_WORKERS = 8;
+var DEFAULT_GOAL_RESUME_PROMPT = "/goal resume";
+var DEFAULT_GOAL_RESUME_STATUSES = ["blocked", "usage_limited"];
+var DEFAULT_GOAL_MIN_INTERVAL = 300;
+var DEFAULT_GOAL_MAX_INTERVAL = 1800;
+var DEFAULT_GOAL_RESET_AFTER = 3600;
+var DEFAULT_GOAL_IDLE_MARKERS = ["Ask Codex to do anything"];
+var DEFAULT_GOAL_BUSY_MARKERS = ["Working ("];
+var DEFAULT_GOAL_MODAL_MARKERS = [
+  "Replace goal?",
+  "Press enter to confirm",
+  "enter to confirm",
+  "esc to cancel",
+  "Would you like to run the following command",
+  "Would you like to make the following edits",
+  "Allow command",
+  "Do you trust the files in this folder"
+];
 function getPluginConfigDir() {
   if (process.env.HERDR_PLUGIN_CONFIG_DIR) {
     return process.env.HERDR_PLUGIN_CONFIG_DIR;
   }
-  return import_node_path.default.join(import_node_os.default.homedir(), ".config", "herdr", "plugins", "config", "bestony.auto-retry");
+  return import_node_path2.default.join(import_node_os2.default.homedir(), ".config", "herdr", "plugins", "config", "bestony.auto-retry");
 }
 function getPluginStateDir() {
   if (process.env.HERDR_PLUGIN_STATE_DIR) {
@@ -56,7 +356,7 @@ function getPluginStateDir() {
   if (process.env.HERDR_CAPACITY_STATE_DIR) {
     return process.env.HERDR_CAPACITY_STATE_DIR;
   }
-  return import_node_path.default.join(import_node_os.default.homedir(), ".local", "state", "herdr-auto-retry");
+  return import_node_path2.default.join(import_node_os2.default.homedir(), ".local", "state", "herdr-auto-retry");
 }
 function parseEnvInt(name, fallback) {
   const val = process.env[name];
@@ -70,13 +370,52 @@ function parseEnvList(name) {
   const lines = val.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
   return lines.length > 0 ? lines : null;
 }
+function parseEnvBool(name) {
+  const val = process.env[name];
+  if (val === void 0 || val === "") return null;
+  return !["0", "false", "no", "off"].includes(val.trim().toLowerCase());
+}
+function parseEnvCsv(name) {
+  const val = process.env[name];
+  if (!val) return null;
+  const items = val.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return items.length > 0 ? items : null;
+}
+function expandHome(p) {
+  if (p === "~") return import_node_os2.default.homedir();
+  if (p.startsWith("~/")) return import_node_path2.default.join(import_node_os2.default.homedir(), p.slice(2));
+  return p;
+}
+function loadGoalResumeConfig(file = {}, overrides = {}) {
+  const statuses = (overrides.statuses || parseEnvCsv("HERDR_AUTO_RETRY_GOAL_STATUSES") || file.statuses || DEFAULT_GOAL_RESUME_STATUSES).map((s) => s.trim().toLowerCase());
+  const deliberate = statuses.filter((s) => DELIBERATE_STATUSES.has(s));
+  if (deliberate.length > 0) {
+    console.warn(
+      `[config] goalResume.statuses includes ${deliberate.join(", ")}; goals paused by a human or by a budget will be resumed`
+    );
+  }
+  const minInterval = overrides.minInterval ?? parseEnvInt("HERDR_AUTO_RETRY_GOAL_MIN_INTERVAL", file.minInterval ?? DEFAULT_GOAL_MIN_INTERVAL);
+  return {
+    enabled: overrides.enabled ?? parseEnvBool("HERDR_AUTO_RETRY_GOAL_RESUME") ?? file.enabled ?? true,
+    prompt: overrides.prompt || process.env.HERDR_AUTO_RETRY_GOAL_PROMPT || file.prompt || DEFAULT_GOAL_RESUME_PROMPT,
+    statuses,
+    minInterval: Math.max(1, minInterval),
+    maxInterval: overrides.maxInterval ?? parseEnvInt("HERDR_AUTO_RETRY_GOAL_MAX_INTERVAL", file.maxInterval ?? DEFAULT_GOAL_MAX_INTERVAL),
+    resetAfter: overrides.resetAfter ?? file.resetAfter ?? DEFAULT_GOAL_RESET_AFTER,
+    codexHome: expandHome(overrides.codexHome || file.codexHome || defaultCodexHome()),
+    rolloutTailBytes: overrides.rolloutTailBytes ?? file.rolloutTailBytes ?? DEFAULT_ROLLOUT_TAIL_BYTES,
+    idleMarkers: overrides.idleMarkers || file.idleMarkers || DEFAULT_GOAL_IDLE_MARKERS,
+    busyMarkers: overrides.busyMarkers || file.busyMarkers || DEFAULT_GOAL_BUSY_MARKERS,
+    modalMarkers: overrides.modalMarkers || file.modalMarkers || DEFAULT_GOAL_MODAL_MARKERS
+  };
+}
 function loadConfig(overrides = {}) {
   const configDir = getPluginConfigDir();
-  const configFile = import_node_path.default.join(configDir, "config.json");
+  const configFile = import_node_path2.default.join(configDir, "config.json");
   let fileConfig = {};
-  if (import_node_fs.default.existsSync(configFile)) {
+  if (import_node_fs2.default.existsSync(configFile)) {
     try {
-      const content = import_node_fs.default.readFileSync(configFile, "utf8");
+      const content = import_node_fs2.default.readFileSync(configFile, "utf8");
       fileConfig = JSON.parse(content);
     } catch (err) {
       console.error(`[config] failed to read ${configFile}:`, err);
@@ -108,13 +447,14 @@ function loadConfig(overrides = {}) {
     },
     workers: overrides.workers ?? parseEnvInt("HERDR_AUTO_RETRY_WORKERS", parseEnvInt("HERDR_CAPACITY_WORKERS", fileConfig.workers ?? DEFAULT_WORKERS)),
     verbose: overrides.verbose ?? (process.env.HERDR_AUTO_RETRY_VERBOSE === "1" || process.env.HERDR_CAPACITY_VERBOSE === "1" || Boolean(fileConfig.verbose)),
-    dryRun: overrides.dryRun ?? fileConfig.dryRun ?? false
+    dryRun: overrides.dryRun ?? fileConfig.dryRun ?? false,
+    goalResume: loadGoalResumeConfig(fileConfig.goalResume, overrides.goalResume)
   };
 }
 
 // src/watcher.ts
-var import_node_fs2 = __toESM(require("fs"));
-var import_node_path2 = __toESM(require("path"));
+var import_node_fs3 = __toESM(require("fs"));
+var import_node_path3 = __toESM(require("path"));
 
 // src/types.ts
 var ScanResult = class {
@@ -131,7 +471,7 @@ var ScanResult = class {
 };
 
 // src/herdr.ts
-var import_node_child_process = require("child_process");
+var import_node_child_process2 = require("child_process");
 var DEFAULT_TIMEOUT_MS = 1e4;
 function getHerdrBinary() {
   return process.env.HERDR_BIN_PATH || "herdr";
@@ -139,7 +479,7 @@ function getHerdrBinary() {
 function runHerdr(args, options = {}) {
   const binary = getHerdrBinary();
   try {
-    const result = (0, import_node_child_process.spawnSync)(binary, args, {
+    const result = (0, import_node_child_process2.spawnSync)(binary, args, {
       encoding: "utf8",
       timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
       windowsHide: true,
@@ -209,6 +549,10 @@ function readTail(target) {
   }
   return null;
 }
+function readVisible(target) {
+  const res = runHerdr(["agent", "read", target, "--source", "visible"]);
+  return res.status === 0 ? res.stdout || "" : null;
+}
 function sendPrompt(target, text) {
   const res = runHerdr(["agent", "prompt", target, text]);
   if (res.status === 0) {
@@ -224,9 +568,6 @@ var SETTLED = /* @__PURE__ */ new Set([
   "done",
   "unknown"
 ]);
-function flatten(text) {
-  return text.split(/\s+/).filter(Boolean).join(" ");
-}
 function findMatch(haystack, patterns) {
   const flat = flatten(haystack).toLowerCase();
   for (const pattern of patterns) {
@@ -246,14 +587,14 @@ var StateStore = class {
   filePath;
   constructor(stateDir) {
     const dir = stateDir || getPluginStateDir();
-    import_node_fs2.default.mkdirSync(dir, { recursive: true });
-    this.filePath = import_node_path2.default.join(dir, "state.json");
+    import_node_fs3.default.mkdirSync(dir, { recursive: true });
+    this.filePath = import_node_path3.default.join(dir, "state.json");
     this.load();
   }
   load() {
-    if (!import_node_fs2.default.existsSync(this.filePath)) return;
+    if (!import_node_fs3.default.existsSync(this.filePath)) return;
     try {
-      const data = JSON.parse(import_node_fs2.default.readFileSync(this.filePath, "utf8"));
+      const data = JSON.parse(import_node_fs3.default.readFileSync(this.filePath, "utf8"));
       if (typeof data === "object" && data !== null) {
         for (const [k, v] of Object.entries(data)) {
           this.cache.set(k, v);
@@ -269,7 +610,7 @@ var StateStore = class {
       for (const [k, v] of this.cache.entries()) {
         obj[k] = v;
       }
-      import_node_fs2.default.writeFileSync(this.filePath, JSON.stringify(obj, null, 2) + "\n", "utf8");
+      import_node_fs3.default.writeFileSync(this.filePath, JSON.stringify(obj, null, 2) + "\n", "utf8");
     } catch (err) {
       console.error(`[state] failed to write ${this.filePath}:`, err);
     }
@@ -294,6 +635,103 @@ var StateStore = class {
     return new Map(this.cache);
   }
 };
+function defaultGoalIO(config) {
+  const { codexHome, rolloutTailBytes } = config.goalResume;
+  return {
+    lookupGoal: (sessionId) => lookupGoalStatus(import_node_path3.default.join(codexHome, GOAL_DB_FILE), sessionId),
+    lastTurnEvent: (sessionId) => {
+      const file = findRolloutFile(codexHome, sessionId);
+      if (!file) {
+        if (config.verbose) console.log(`[goal] no rollout file for session ${sessionId}`);
+        return null;
+      }
+      try {
+        return readLastTurnEvent(file, rolloutTailBytes);
+      } catch (err) {
+        console.error(`[goal] failed to read rollout ${file}: ${err?.message || err}`);
+        return null;
+      }
+    },
+    readScreen: readVisible,
+    send: sendPrompt
+  };
+}
+function processGoal(target, agent, state, config, store, nowSec, io = defaultGoalIO(config)) {
+  const gc = config.goalResume;
+  const sessionId = agent.agent_session?.value;
+  if (!sessionId) {
+    if (config.verbose) console.log(`[${target}] goal: no codex session id; skipping goal check`);
+    return null;
+  }
+  const goal = io.lookupGoal(sessionId);
+  if (goal.kind === "error") {
+    if (state.last_goal_skip_reason !== "goal-unavailable") {
+      console.error(`[${target}] goal: cannot read goal status: ${goal.error}`);
+      state.last_goal_skip_reason = "goal-unavailable";
+      store.set(target, state);
+    }
+    return null;
+  }
+  const status = goal.kind === "found" ? goal.status : void 0;
+  if (status !== state.last_goal_status) {
+    if (status !== void 0 || state.last_goal_status !== void 0) {
+      console.log(`[${target}] goal status: ${state.last_goal_status ?? "none"} -> ${status ?? "none"}`);
+    }
+    state.last_goal_status = status;
+    store.set(target, state);
+  }
+  if (goal.kind === "found" && goal.source !== "ro" && config.verbose) {
+    console.log(`[${target}] goal: status read via ${goal.source} fallback (may lag the WAL)`);
+  }
+  if (status === void 0 || !isResumableStatus(status, gc.statuses)) {
+    if (state.last_goal_skip_reason !== void 0) {
+      state.last_goal_skip_reason = void 0;
+      store.set(target, state);
+    }
+    return null;
+  }
+  const lastTurnEvent = io.lastTurnEvent(sessionId);
+  const screen = lastTurnEvent === "task_complete" ? io.readScreen(target) : null;
+  const decision = decideGoalResume({
+    goal,
+    lastTurnEvent,
+    screen,
+    history: state,
+    nowSec,
+    config: gc
+  });
+  if (decision.action === "skip") {
+    const detail = decision.reason === "rate-limited" ? ` (${decision.remaining}s until next resume)` : "";
+    if (decision.reason !== state.last_goal_skip_reason) {
+      console.log(`[${target}] goal ${status}: waiting (${decision.reason})${detail}`);
+      state.last_goal_skip_reason = decision.reason;
+      store.set(target, state);
+    } else if (config.verbose) {
+      console.log(`[${target}] goal ${status}: still waiting (${decision.reason})${detail}`);
+    }
+    return decision.stalled ? "stuck" /* STUCK */ : null;
+  }
+  state.last_goal_resume_at = nowSec;
+  state.next_goal_resume_at = decision.nextAllowedAt;
+  state.goal_resume_count = decision.attempt;
+  state.total_goal_resumes = (state.total_goal_resumes || 0) + 1;
+  state.last_goal_skip_reason = void 0;
+  store.set(target, state);
+  if (config.dryRun) {
+    console.log(
+      `[${target}] [dry-run] goal ${status}: would send "${gc.prompt}" (attempt ${decision.attempt}, next allowed in ${decision.backoff}s)`
+    );
+    return "stuck" /* STUCK */;
+  }
+  console.log(
+    `[${target}] goal ${status}: sending "${gc.prompt}" (attempt ${decision.attempt}, next allowed in ${decision.backoff}s)`
+  );
+  const sent = io.send(target, gc.prompt);
+  if (!sent.ok) {
+    console.error(`[${target}] goal: failed to send "${gc.prompt}" (exit ${sent.status}): ${sent.error || "no output"}`);
+  }
+  return "stuck" /* STUCK */;
+}
 async function processTarget(target, config, store, nowSec = Date.now() / 1e3) {
   const agent = getAgent(target);
   const state = store.get(target);
@@ -314,6 +752,10 @@ async function processTarget(target, config, store, nowSec = Date.now() / 1e3) {
       store.set(target, state);
     }
     return "present" /* PRESENT */;
+  }
+  if (agentType === "codex" && config.goalResume.enabled) {
+    const goalOutcome = processGoal(target, agent, state, config, store, nowSec);
+    if (goalOutcome !== null) return goalOutcome;
   }
   const tail = readTail(target);
   if (tail === null) {
@@ -442,18 +884,18 @@ async function scanOnce(config, store, targetList) {
 }
 
 // src/daemon.ts
-var import_node_fs3 = __toESM(require("fs"));
-var import_node_path3 = __toESM(require("path"));
-var import_node_child_process2 = require("child_process");
+var import_node_fs4 = __toESM(require("fs"));
+var import_node_path4 = __toESM(require("path"));
+var import_node_child_process3 = require("child_process");
 function getPidFile() {
   const dir = getPluginStateDir();
-  import_node_fs3.default.mkdirSync(dir, { recursive: true });
-  return import_node_path3.default.join(dir, "daemon.pid");
+  import_node_fs4.default.mkdirSync(dir, { recursive: true });
+  return import_node_path4.default.join(dir, "daemon.pid");
 }
 function getLogFile() {
   const dir = getPluginStateDir();
-  import_node_fs3.default.mkdirSync(dir, { recursive: true });
-  return import_node_path3.default.join(dir, "daemon.log");
+  import_node_fs4.default.mkdirSync(dir, { recursive: true });
+  return import_node_path4.default.join(dir, "daemon.log");
 }
 var INVOCATION_ENV_KEYS = ["HERDR_PLUGIN_EVENT", "HERDR_PLUGIN_ACTION_ID"];
 function buildDaemonEnv(env) {
@@ -478,15 +920,15 @@ function isPidAlive(pid) {
 }
 function getRunningPid() {
   const pidFile = getPidFile();
-  if (!import_node_fs3.default.existsSync(pidFile)) return null;
+  if (!import_node_fs4.default.existsSync(pidFile)) return null;
   try {
-    const raw = import_node_fs3.default.readFileSync(pidFile, "utf8").trim();
+    const raw = import_node_fs4.default.readFileSync(pidFile, "utf8").trim();
     const pid = parseInt(raw, 10);
     if (!isNaN(pid) && isPidAlive(pid)) {
       return pid;
     }
     try {
-      import_node_fs3.default.unlinkSync(pidFile);
+      import_node_fs4.default.unlinkSync(pidFile);
     } catch {
     }
     return null;
@@ -500,8 +942,8 @@ function startDaemon(entryPath) {
     return { started: false, pid: existingPid };
   }
   const logFile = getLogFile();
-  const logFd = import_node_fs3.default.openSync(logFile, "a");
-  const child = (0, import_node_child_process2.spawn)(process.execPath, [entryPath, "daemon", "--run"], {
+  const logFd = import_node_fs4.default.openSync(logFile, "a");
+  const child = (0, import_node_child_process3.spawn)(process.execPath, [entryPath, "daemon", "--run"], {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     windowsHide: true,
@@ -509,7 +951,7 @@ function startDaemon(entryPath) {
   });
   const pid = child.pid;
   child.unref();
-  import_node_fs3.default.writeFileSync(getPidFile(), String(pid), "utf8");
+  import_node_fs4.default.writeFileSync(getPidFile(), String(pid), "utf8");
   return { started: true, pid };
 }
 function stopDaemon() {
@@ -523,20 +965,20 @@ function stopDaemon() {
   }
   const pidFile = getPidFile();
   try {
-    import_node_fs3.default.unlinkSync(pidFile);
+    import_node_fs4.default.unlinkSync(pidFile);
   } catch {
   }
   return { stopped: true, pid };
 }
 async function runDaemonLoop(config, store) {
   const pid = process.pid;
-  import_node_fs3.default.writeFileSync(getPidFile(), String(pid), "utf8");
+  import_node_fs4.default.writeFileSync(getPidFile(), String(pid), "utf8");
   let shouldExit = false;
   const onSignal = () => {
     shouldExit = true;
     console.log(`[daemon] received shutdown signal; stopping`);
     try {
-      import_node_fs3.default.unlinkSync(getPidFile());
+      import_node_fs4.default.unlinkSync(getPidFile());
     } catch {
     }
     process.exit(0);
@@ -568,8 +1010,8 @@ async function runDaemonLoop(config, store) {
 }
 
 // src/dashboard.ts
-var import_node_fs4 = __toESM(require("fs"));
-var import_node_path4 = __toESM(require("path"));
+var import_node_fs5 = __toESM(require("fs"));
+var import_node_path5 = __toESM(require("path"));
 function renderStatus(config, store) {
   const pid = getRunningPid();
   const isRunning = pid !== null;
@@ -583,6 +1025,10 @@ function renderStatus(config, store) {
   lines.push(`Backoff Range : ${config.minWait}s -> ${config.maxWait}s`);
   lines.push(
     `Cadence       : busy=${config.intervals.busy}s, active=${config.intervals.active}s, idle=${config.intervals.idle}s`
+  );
+  const gr = config.goalResume;
+  lines.push(
+    `Goal Resume   : ${gr.enabled ? `on ("${gr.prompt}" for ${gr.statuses.join("/")}, ${gr.minInterval}s -> ${gr.maxInterval}s)` : "off"}`
   );
   lines.push("--------------------------------------------------");
   const agents = listAgents();
@@ -608,13 +1054,20 @@ function renderStatus(config, store) {
       if (isStuck && state.last_matched_pattern) {
         lines.push(`    Banner: "${state.last_matched_pattern}"`);
       }
+      if (state.last_goal_status) {
+        const nextGoal = Math.max(0, Math.round((state.next_goal_resume_at ?? 0) - nowSec));
+        const waiting = state.last_goal_skip_reason ? `, waiting: ${state.last_goal_skip_reason}` : "";
+        lines.push(
+          `    Goal: ${state.last_goal_status} (resumes: ${state.total_goal_resumes ?? 0}${nextGoal > 0 ? `, next allowed in ${nextGoal}s` : ""}${waiting})`
+        );
+      }
     }
   }
   lines.push("--------------------------------------------------");
-  const logFile = import_node_path4.default.join(getPluginStateDir(), "daemon.log");
-  if (import_node_fs4.default.existsSync(logFile)) {
+  const logFile = import_node_path5.default.join(getPluginStateDir(), "daemon.log");
+  if (import_node_fs5.default.existsSync(logFile)) {
     try {
-      const logs = import_node_fs4.default.readFileSync(logFile, "utf8").trim().split("\n");
+      const logs = import_node_fs5.default.readFileSync(logFile, "utf8").trim().split("\n");
       const recent = logs.slice(-8);
       lines.push("Recent Daemon Log Entries:");
       for (const logLine of recent) {

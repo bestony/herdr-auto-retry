@@ -9,7 +9,15 @@ import {
   type PluginConfig,
 } from "./types.js";
 import { getPluginStateDir } from "./config.js";
-import { getAgent, listAgents, readTail, sendPrompt } from "./herdr.js";
+import { flatten } from "./text.js";
+import { getAgent, listAgents, readTail, readVisible, sendPrompt, type SendResult } from "./herdr.js";
+import { decideGoalResume, isResumableStatus, type GoalLookup, type TurnEvent } from "./codex-goal.js";
+import {
+  GOAL_DB_FILE,
+  findRolloutFile,
+  lookupGoalStatus,
+  readLastTurnEvent,
+} from "./codex-store.js";
 
 // "blocked" is excluded: the agent waits on a human approval, and
 // `herdr agent prompt` rejects submissions to blocked agents.
@@ -19,9 +27,7 @@ export const SETTLED: ReadonlySet<AgentStatus> = new Set([
   "unknown",
 ]);
 
-export function flatten(text: string): string {
-  return text.split(/\s+/).filter(Boolean).join(" ");
-}
+export { flatten };
 
 export function findMatch(haystack: string, patterns: string[]): string | null {
   const flat = flatten(haystack).toLowerCase();
@@ -103,6 +109,140 @@ export class StateStore {
   }
 }
 
+/** IO used by the codex goal resume step. Replaced by fakes in tests. */
+export interface GoalIO {
+  lookupGoal(sessionId: string): GoalLookup;
+  lastTurnEvent(sessionId: string): TurnEvent | null;
+  readScreen(target: string): string | null;
+  send(target: string, text: string): SendResult;
+}
+
+export function defaultGoalIO(config: PluginConfig): GoalIO {
+  const { codexHome, rolloutTailBytes } = config.goalResume;
+  return {
+    lookupGoal: (sessionId) => lookupGoalStatus(path.join(codexHome, GOAL_DB_FILE), sessionId),
+    lastTurnEvent: (sessionId) => {
+      const file = findRolloutFile(codexHome, sessionId);
+      if (!file) {
+        if (config.verbose) console.log(`[goal] no rollout file for session ${sessionId}`);
+        return null;
+      }
+      try {
+        return readLastTurnEvent(file, rolloutTailBytes);
+      } catch (err) {
+        console.error(`[goal] failed to read rollout ${file}: ${(err as any)?.message || err}`);
+        return null;
+      }
+    },
+    readScreen: readVisible,
+    send: sendPrompt,
+  };
+}
+
+/**
+ * Codex goal resume step.
+ *
+ * Returns an outcome when the goal is stalled (resumable status) and this step
+ * owns the target for this scan. Returns null when the goal is not stalled, so
+ * the banner-based retry runs as before. A stalled goal needs `/goal resume`,
+ * not "continue": a plain prompt starts a turn but leaves the goal stalled.
+ */
+export function processGoal(
+  target: string,
+  agent: AgentInfo,
+  state: TargetStateData,
+  config: PluginConfig,
+  store: StateStore,
+  nowSec: number,
+  io: GoalIO = defaultGoalIO(config)
+): Outcome | null {
+  const gc = config.goalResume;
+  const sessionId = agent.agent_session?.value;
+  if (!sessionId) {
+    if (config.verbose) console.log(`[${target}] goal: no codex session id; skipping goal check`);
+    return null;
+  }
+
+  const goal = io.lookupGoal(sessionId);
+  if (goal.kind === "error") {
+    if (state.last_goal_skip_reason !== "goal-unavailable") {
+      console.error(`[${target}] goal: cannot read goal status: ${goal.error}`);
+      state.last_goal_skip_reason = "goal-unavailable";
+      store.set(target, state);
+    }
+    return null;
+  }
+
+  const status = goal.kind === "found" ? goal.status : undefined;
+  if (status !== state.last_goal_status) {
+    if (status !== undefined || state.last_goal_status !== undefined) {
+      console.log(`[${target}] goal status: ${state.last_goal_status ?? "none"} -> ${status ?? "none"}`);
+    }
+    state.last_goal_status = status;
+    store.set(target, state);
+  }
+  if (goal.kind === "found" && goal.source !== "ro" && config.verbose) {
+    console.log(`[${target}] goal: status read via ${goal.source} fallback (may lag the WAL)`);
+  }
+
+  if (status === undefined || !isResumableStatus(status, gc.statuses)) {
+    if (state.last_goal_skip_reason !== undefined) {
+      state.last_goal_skip_reason = undefined;
+      store.set(target, state);
+    }
+    return null;
+  }
+
+  const lastTurnEvent = io.lastTurnEvent(sessionId);
+  // Read the screen only when the turn has ended; the decision ignores it otherwise.
+  const screen = lastTurnEvent === "task_complete" ? io.readScreen(target) : null;
+
+  const decision = decideGoalResume({
+    goal,
+    lastTurnEvent,
+    screen,
+    history: state,
+    nowSec,
+    config: gc,
+  });
+
+  if (decision.action === "skip") {
+    const detail =
+      decision.reason === "rate-limited" ? ` (${decision.remaining}s until next resume)` : "";
+    if (decision.reason !== state.last_goal_skip_reason) {
+      console.log(`[${target}] goal ${status}: waiting (${decision.reason})${detail}`);
+      state.last_goal_skip_reason = decision.reason;
+      store.set(target, state);
+    } else if (config.verbose) {
+      console.log(`[${target}] goal ${status}: still waiting (${decision.reason})${detail}`);
+    }
+    return decision.stalled ? Outcome.STUCK : null;
+  }
+
+  state.last_goal_resume_at = nowSec;
+  state.next_goal_resume_at = decision.nextAllowedAt;
+  state.goal_resume_count = decision.attempt;
+  state.total_goal_resumes = (state.total_goal_resumes || 0) + 1;
+  state.last_goal_skip_reason = undefined;
+  store.set(target, state);
+
+  if (config.dryRun) {
+    console.log(
+      `[${target}] [dry-run] goal ${status}: would send "${gc.prompt}" (attempt ${decision.attempt}, next allowed in ${decision.backoff}s)`
+    );
+    return Outcome.STUCK;
+  }
+
+  console.log(
+    `[${target}] goal ${status}: sending "${gc.prompt}" (attempt ${decision.attempt}, next allowed in ${decision.backoff}s)`
+  );
+  const sent = io.send(target, gc.prompt);
+  if (!sent.ok) {
+    console.error(`[${target}] goal: failed to send "${gc.prompt}" (exit ${sent.status}): ${sent.error || "no output"}`);
+  }
+  return Outcome.STUCK;
+}
+
 export async function processTarget(
   target: string,
   config: PluginConfig,
@@ -135,6 +275,12 @@ export async function processTarget(
       store.set(target, state);
     }
     return Outcome.PRESENT;
+  }
+
+  // Codex goal mode: a stalled goal needs `/goal resume` once the turn ends.
+  if (agentType === "codex" && config.goalResume.enabled) {
+    const goalOutcome = processGoal(target, agent, state, config, store, nowSec);
+    if (goalOutcome !== null) return goalOutcome;
   }
 
   // Read terminal tail

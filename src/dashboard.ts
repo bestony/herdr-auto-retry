@@ -21,6 +21,10 @@ export function renderStatus(config: PluginConfig, store: StateStore): string {
   lines.push(
     `Cadence       : busy=${config.intervals.busy}s, active=${config.intervals.active}s, idle=${config.intervals.idle}s`
   );
+  const gr = config.goalResume;
+  lines.push(
+    `Goal Resume   : ${gr.enabled ? `on ("${gr.prompt}" for ${gr.statuses.join("/")}, ${gr.minInterval}s -> ${gr.maxInterval}s)` : "off"}`
+  );
   lines.push("--------------------------------------------------");
 
   const agents = listAgents();
@@ -51,6 +55,15 @@ export function renderStatus(config: PluginConfig, store: StateStore): string {
       );
       if (isStuck && state.last_matched_pattern) {
         lines.push(`    Banner: "${state.last_matched_pattern}"`);
+      }
+      if (state.last_goal_status) {
+        const nextGoal = Math.max(0, Math.round((state.next_goal_resume_at ?? 0) - nowSec));
+        const waiting = state.last_goal_skip_reason ? `, waiting: ${state.last_goal_skip_reason}` : "";
+        lines.push(
+          `    Goal: ${state.last_goal_status} (resumes: ${state.total_goal_resumes ?? 0}${
+            nextGoal > 0 ? `, next allowed in ${nextGoal}s` : ""
+          }${waiting})`
+        );
       }
     }
   }

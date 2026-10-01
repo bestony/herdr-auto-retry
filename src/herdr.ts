@@ -96,6 +96,15 @@ export function readTail(target: string): string | null {
   return null;
 }
 
+/**
+ * Returns the currently visible screen of the agent pane, or null when the
+ * pane cannot be read. Used to check that the codex composer is idle.
+ */
+export function readVisible(target: string): string | null {
+  const res = runHerdr(["agent", "read", target, "--source", "visible"]);
+  return res.status === 0 ? res.stdout || "" : null;
+}
+
 export interface SendResult {
   ok: boolean;
   status: number;
