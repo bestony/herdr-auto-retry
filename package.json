@@ -1,6 +1,6 @@
 {
   "name": "herdr-auto-retry",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "packageManager": "pnpm@11.1.2",
   "description": "Auto-continue Herdr agents when rate-limited, overloaded, or at capacity.",
   "main": "dist/index.js",

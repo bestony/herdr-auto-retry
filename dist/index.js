@@ -1151,7 +1151,7 @@ async function main() {
     case "--help":
     case "-h":
     case "help": {
-      console.log(`herdr-auto-retry v0.1.0 (Plugin ID: bestony.auto-retry)
+      console.log(`herdr-auto-retry v0.2.0 (Plugin ID: bestony.auto-retry)
 
 Auto-continue Herdr agents when rate-limited, overloaded, or at capacity.
 
