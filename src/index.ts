@@ -82,6 +82,11 @@ Commands:
 Configuration:
   Settings can be configured in ~/.config/herdr/plugins/config/bestony.auto-retry/config.json
   or through environment variables (HERDR_AUTO_RETRY_*).
+
+Codex goals:
+  Stalled codex goals (blocked, usage_limited) get "/goal resume" after the
+  turn ends and the composer is idle. Configure with "goalResume" in config.json
+  or HERDR_AUTO_RETRY_GOAL_* variables; HERDR_AUTO_RETRY_GOAL_RESUME=0 disables it.
 `);
       break;
     }

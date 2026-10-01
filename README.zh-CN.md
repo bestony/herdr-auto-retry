@@ -39,6 +39,8 @@ exceeded retry limit, last status: 429 Too Many Requests, request id: ...
 - **指数退避与防抖保护**：
   - 指数递增等待时间（默认 15s -> 30s -> 最多 60s）。
   - 防抖机制：连续 3 次扫描未见报错横幅才判定本轮异常恢复，避免由于终端刷新/动效导致的误判。
+- **Codex Goal 自动恢复**：
+  - Codex goal 停滞（`Goal stalled (/goal resume)`）时，在当前回合结束后自动发送 `/goal resume`。详见 [Codex Goal 自动恢复](#codex-goal-自动恢复)。
 - **灵活扩展与配置**：
   - 支持监控多种 Agent（默认为 Codex，可自定义扩展为 Claude 等）。
   - 支持通过 JSON 文件或环境变量自定义匹配特征、重试提示词、等待参数等。
@@ -132,6 +134,78 @@ herdr plugin config-dir bestony.auto-retry
 | `HERDR_AUTO_RETRY_IDLE_INTERVAL` | 没有 Agent 时的休眠间隔（秒） | `60` |
 | `HERDR_AUTO_RETRY_WORKERS` | 最大并发扫描/重试并发数 | `8` |
 | `HERDR_AUTO_RETRY_VERBOSE` | 是否输出详细日志（`1` 或 `0`） | `0` |
+| `HERDR_AUTO_RETRY_GOAL_RESUME` | 是否启用 codex goal 自动恢复（`1` 或 `0`） | `1` |
+| `HERDR_AUTO_RETRY_GOAL_PROMPT` | 恢复停滞 goal 时发送的提示词 | `/goal resume` |
+| `HERDR_AUTO_RETRY_GOAL_STATUSES` | 需要恢复的 goal 状态（逗号分隔） | `blocked,usage_limited` |
+| `HERDR_AUTO_RETRY_GOAL_MIN_INTERVAL` | 同一 Agent 两次恢复的最小间隔（秒） | `300` |
+| `HERDR_AUTO_RETRY_GOAL_MAX_INTERVAL` | 恢复退避上限（秒） | `1800` |
+| `HERDR_AUTO_RETRY_SQLITE_BIN` | 无 `node:sqlite` 时使用的 `sqlite3` 命令 | `sqlite3` |
+| `CODEX_HOME` | Codex 主目录 | `~/.codex` |
+
+---
+
+## Codex Goal 自动恢复
+
+Codex 以 goal 模式（`/goal <objective>`）工作时，如果遇到临时的服务端错误或用量限制，会把 goal 标记为 `blocked` 或 `usage_limited`，界面显示 `Goal stalled (/goal resume)`。Agent 可能会跑完当前回合，但之后不会继续。发送普通的 `continue` 无法解决，因为 goal 仍处于停滞状态。
+
+对每个被监控的 `codex` Agent，每次扫描按顺序检查：
+
+1. herdr 报告 Agent 已停下（不是 `working` 或 `blocked`）。
+2. `<codexHome>/goals_1.sqlite`（表 `thread_goals`，主键为 `herdr agent get` 返回的 codex session id）中的 goal 状态属于 `goalResume.statuses`。优先用 `?mode=ro` 打开；失败时（WAL 模式下只读无法创建 `-shm`）改用 `?mode=ro&immutable=1`，该模式忽略 WAL，读到的状态可能略旧。
+3. rollout 文件（`<codexHome>/sessions/YYYY/MM/DD/rollout-*-<session>.jsonl`）尾部最后一个回合事件是 `task_complete`。尾部找不到 `task_started` / `task_complete` / `turn_aborted` 时视为未知并继续等待；`turn_aborted` 交给人工处理。
+4. 可见屏幕（`herdr agent read --source visible`）显示空闲输入框（`Ask Codex to do anything`），不含 `Working (`，且没有选择列表或模态框（例如 `Replace goal?` 或审批弹层）。
+5. 该 Agent 的限速允许本次发送。
+
+满足后通过 `herdr agent prompt` 发送 `/goal resume`，不会切换焦点。
+
+规则：
+
+- 默认只恢复 `blocked` 和 `usage_limited`。`paused`（人工暂停）、`budget_limited`（主动设置的预算）、`active`、`complete` 不会被恢复。可以把 `paused` 或 `budget_limited` 加入 `goalResume.statuses`，此时插件会打印警告；`active` 和 `complete` 永远不会被恢复。
+- 限速：一次恢复后，同一 Agent 至少等待 `minInterval` 秒。如果在 `resetAfter` 秒内再次停滞，等待时间逐次翻倍，最多到 `maxInterval`；超过 `resetAfter` 后的停滞重新从 `minInterval` 开始。
+- goal 停滞期间，该 Agent 的横幅重试（`continue`）会被跳过；goal 未停滞或没有 goal 时，横幅重试照常工作。
+- 每次状态变化、每次恢复、每个新的等待原因都会写入日志；`HERDR_AUTO_RETRY_VERBOSE=1` 输出每次扫描的细节；`dryRun: true` 只记录不发送。
+- SQLite 读取优先使用 Node 自带的 `node:sqlite`（Node 22.13+ / 23.4+），否则调用 `sqlite3` 命令行（可用 `HERDR_AUTO_RETRY_SQLITE_BIN` 指定路径）。Node 22 下 `node:sqlite` 可能在守护进程日志中输出 `ExperimentalWarning`。
+
+配置（`config.json` 中的 `goalResume`，以下为默认值）：
+
+```json
+{
+  "goalResume": {
+    "enabled": true,
+    "prompt": "/goal resume",
+    "statuses": ["blocked", "usage_limited"],
+    "minInterval": 300,
+    "maxInterval": 1800,
+    "resetAfter": 3600,
+    "codexHome": "~/.codex",
+    "rolloutTailBytes": 2097152,
+    "idleMarkers": ["Ask Codex to do anything"],
+    "busyMarkers": ["Working ("],
+    "modalMarkers": [
+      "Replace goal?",
+      "Press enter to confirm",
+      "enter to confirm",
+      "esc to cancel",
+      "Would you like to run the following command",
+      "Would you like to make the following edits",
+      "Allow command",
+      "Do you trust the files in this folder"
+    ]
+  }
+}
+```
+
+| 键 | 说明 | 默认值 |
+| -- | ---- | ------ |
+| `enabled` | 是否自动恢复停滞的 codex goal | `true` |
+| `prompt` | 恢复 goal 时发送的文本 | `/goal resume` |
+| `statuses` | 触发恢复的 goal 状态 | `["blocked", "usage_limited"]` |
+| `minInterval` | 同一 Agent 两次恢复的最小间隔（秒） | `300` |
+| `maxInterval` | 反复停滞时的最大退避（秒） | `1800` |
+| `resetAfter` | 距上次恢复超过该秒数的停滞视为新一轮 | `3600` |
+| `codexHome` | Codex 主目录 | `$CODEX_HOME` 或 `~/.codex` |
+| `rolloutTailBytes` | 从 rollout 文件末尾读取的字节数 | `2097152`（2 MB） |
+| `idleMarkers` / `busyMarkers` / `modalMarkers` | 空闲输入框 / 回合进行中 / 模态框的屏幕特征文本 | 见上 |
 
 ---
 
